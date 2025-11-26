@@ -41,7 +41,6 @@ cognitive-critical-slowing/
 │   ├── methods_supplement.md
 │   └── statistical_analysis_plan.md
 ├
-├
 ├── requirements.txt
 └── README.md
 ```
