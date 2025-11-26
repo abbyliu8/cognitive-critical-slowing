@@ -40,10 +40,8 @@ cognitive-critical-slowing/
 ├── docs/
 │   ├── methods_supplement.md
 │   └── statistical_analysis_plan.md
-├── figures/
-│   └── [generated figures]
-├── data/
-│   └── README.md
+├
+├
 ├── requirements.txt
 └── README.md
 ```
