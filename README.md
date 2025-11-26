@@ -117,12 +117,8 @@ If you use this code, please cite:
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Acknowledgments
 
-- CHARLS research team at Peking University
-- ELSA research team at University College London
-- Funding sources: [To be added]
 
 ## Contact
 
-For questions or collaboration inquiries, please open an issue or contact [abbyliu8@example.com].
+For questions or collaboration inquiries, please open an issue or contact [uctqhhl@ucl.ac.uk].
