@@ -2,11 +2,12 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 from scipy.stats import mstats
-from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import argparse
 import warnings
+import os
 warnings.filterwarnings('ignore')
 
 
@@ -14,14 +15,20 @@ def load_elsa_data(filepath):
     return pd.read_csv(filepath, low_memory=False)
 
 
-def construct_elsa_cohort(df, memory_col='memory', id_col='idauniq', wave_col='wave', 
-                          min_age=50, n_waves=6):
-    wave_counts = df.groupby(id_col).apply(lambda x: x[memory_col].notna().sum())
-    complete_ids = wave_counts[wave_counts == n_waves].index
+def construct_elsa_cohort(df, memory_col='memory', id_col='idauniq', wave_col='wave',
+                          min_age=50, min_wave=4, max_wave=9):
+    n_waves = max_wave - min_wave + 1
     
-    cohort = df[df[id_col].isin(complete_ids)].copy()
+    df_filtered = df[(df[wave_col] >= min_wave) & (df[wave_col] <= max_wave)].copy()
     
-    baseline = cohort[cohort[wave_col] == cohort[wave_col].min()]
+    wave_memory_counts = df_filtered.groupby(id_col).apply(
+        lambda x: x[x[memory_col].notna()][wave_col].nunique()
+    )
+    complete_ids = wave_memory_counts[wave_memory_counts == n_waves].index
+    
+    cohort = df_filtered[df_filtered[id_col].isin(complete_ids)].copy()
+    
+    baseline = cohort[cohort[wave_col] == min_wave]
     age_eligible = baseline[baseline['age'] >= min_age][id_col].unique()
     cohort = cohort[cohort[id_col].isin(age_eligible)]
     
@@ -87,24 +94,43 @@ def compute_csd_indicators(df, outcome_col, groups, id_col='idauniq', wave_col='
 
 
 def winsorize_statistics(data, limits=(0.05, 0.05)):
-    winsorized = mstats.winsorize(data.dropna(), limits=limits)
-    return winsorized.mean(), winsorized.std()
+    clean_data = data.dropna()
+    if len(clean_data) < 10:
+        return clean_data.mean(), clean_data.std()
+    winsorized = mstats.winsorize(clean_data, limits=limits)
+    return float(np.mean(winsorized)), float(np.std(winsorized))
 
 
 def compute_cci(csd_df):
     valid_df = csd_df.dropna(subset=['ar1', 'variance']).copy()
     scaler = StandardScaler()
     valid_df['ar1_z'] = scaler.fit_transform(valid_df[['ar1']])
-    valid_df['variance_z'] = scaler.fit_transform(valid_df[['variance']])
+    scaler2 = StandardScaler()
+    valid_df['variance_z'] = scaler2.fit_transform(valid_df[['variance']])
     valid_df['cci'] = (valid_df['ar1_z'] + valid_df['variance_z']) / 2
     return valid_df
+
+
+def cohens_d(group1, group2):
+    n1, n2 = len(group1), len(group2)
+    if n1 < 2 or n2 < 2:
+        return np.nan
+    var1, var2 = group1.var(), group2.var()
+    pooled_std = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+    if pooled_std == 0:
+        return np.nan
+    return (group1.mean() - group2.mean()) / pooled_std
 
 
 def compute_statistics(csd_df, metric, use_winsorize=False):
     groups = ['Decline', 'Stable', 'Improved']
     group_data = {g: csd_df[csd_df['trajectory_group'] == g][metric].dropna() for g in groups}
     
-    f_stat, p_value = stats.f_oneway(*[group_data[g] for g in groups if len(group_data[g]) > 0])
+    valid_groups = [group_data[g] for g in groups if len(group_data[g]) > 0]
+    if len(valid_groups) < 2:
+        return None
+    
+    f_stat, p_value = stats.f_oneway(*valid_groups)
     
     if use_winsorize:
         group_means = {}
@@ -117,17 +143,20 @@ def compute_statistics(csd_df, metric, use_winsorize=False):
         group_means = {g: group_data[g].mean() for g in groups}
         group_sds = {g: group_data[g].std() for g in groups}
     
+    d1, d2 = group_data['Decline'], group_data['Stable']
+    t_stat, t_pvalue = stats.ttest_ind(d1, d2)
+    effect_size = cohens_d(d1, d2)
+    
     results = {
         'f_statistic': f_stat,
         'p_value': p_value,
         'group_means': group_means,
-        'group_sds': group_sds
+        'group_sds': group_sds,
+        'group_n': {g: len(group_data[g]) for g in groups},
+        't_statistic': t_stat,
+        't_pvalue': t_pvalue,
+        'cohens_d': effect_size
     }
-    
-    d1, d2 = group_data['Decline'], group_data['Stable']
-    t_stat, t_pvalue = stats.ttest_ind(d1, d2)
-    results['t_statistic'] = t_stat
-    results['t_pvalue'] = t_pvalue
     
     return results
 
@@ -136,14 +165,28 @@ def evaluate_prediction(csd_df, predictor='cci'):
     valid_df = csd_df.dropna(subset=[predictor, 'trajectory_group'])
     y_true = (valid_df['trajectory_group'] == 'Decline').astype(int)
     y_score = valid_df[predictor]
+    
     auc = roc_auc_score(y_true, y_score)
     fpr, tpr, thresholds = roc_curve(y_true, y_score)
+    
     youden_idx = np.argmax(tpr - fpr)
     optimal_threshold = thresholds[youden_idx]
+    
+    y_pred = (y_score >= optimal_threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0
+    
     return {
         'auc': auc,
-        'sensitivity': tpr[youden_idx],
-        'specificity': 1 - fpr[youden_idx],
+        'sensitivity': sensitivity,
+        'specificity': specificity,
+        'ppv': ppv,
+        'npv': npv,
+        'optimal_threshold': optimal_threshold,
         'fpr': fpr,
         'tpr': tpr
     }
@@ -161,34 +204,35 @@ def create_validation_figure(csd_df, performance, output_path):
         ax.hist(data, bins=30, alpha=0.6, label=group, color=colors[group])
     ax.set_xlabel('AR(1) Coefficient')
     ax.set_ylabel('Frequency')
-    ax.set_title('AR(1) Distribution by Group (ELSA)')
+    ax.set_title('AR(1) Distribution by Trajectory Group')
     ax.legend()
     ax.axvline(x=0, color='black', linestyle='--', alpha=0.5)
     
     ax = axes[0, 1]
     for group in groups:
         data = csd_df[csd_df['trajectory_group'] == group]['variance'].dropna()
-        ax.hist(data, bins=30, alpha=0.6, label=group, color=colors[group])
+        data_clipped = data[data < data.quantile(0.95)]
+        ax.hist(data_clipped, bins=30, alpha=0.6, label=group, color=colors[group])
     ax.set_xlabel('Variance')
     ax.set_ylabel('Frequency')
-    ax.set_title('Variance Distribution by Group (ELSA)')
+    ax.set_title('Variance Distribution by Trajectory Group')
     ax.legend()
     
     ax = axes[1, 0]
     group_means = [csd_df[csd_df['trajectory_group'] == g]['ar1'].mean() for g in groups]
     group_sems = [csd_df[csd_df['trajectory_group'] == g]['ar1'].sem() for g in groups]
-    bars = ax.bar(groups, group_means, yerr=group_sems, color=[colors[g] for g in groups], capsize=5)
-    ax.set_ylabel('Mean AR(1)')
-    ax.set_title('AR(1) by Trajectory Group (ELSA)')
+    ax.bar(groups, group_means, yerr=group_sems, color=[colors[g] for g in groups], capsize=5)
+    ax.set_ylabel('Mean AR(1) Coefficient')
+    ax.set_title('AR(1) by Trajectory Group')
     ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
     
     ax = axes[1, 1]
     ax.plot(performance['fpr'], performance['tpr'], 'b-', linewidth=2,
-            label=f'ELSA AUC = {performance["auc"]:.3f}')
+            label=f'AUC = {performance["auc"]:.3f}')
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.5)
     ax.set_xlabel('False Positive Rate')
     ax.set_ylabel('True Positive Rate')
-    ax.set_title('ROC Curve - External Validation (ELSA)')
+    ax.set_title('ROC Curve: CCI Predicting Cognitive Decline')
     ax.legend(loc='lower right')
     ax.set_xlim([0, 1])
     ax.set_ylim([0, 1])
@@ -205,35 +249,73 @@ def generate_validation_report(csd_df, ar1_stats, var_stats, performance, output
     report.append("ELSA EXTERNAL VALIDATION REPORT")
     report.append("=" * 70)
     report.append("")
-    report.append("[SAMPLE]")
+    
+    report.append("[SAMPLE CHARACTERISTICS]")
     report.append(f"Total participants: {len(csd_df):,}")
+    report.append(f"Observation waves: 6 (Waves 4-9, 2008-2018)")
     for group in ['Decline', 'Stable', 'Improved']:
         n = (csd_df['trajectory_group'] == group).sum()
         pct = n / len(csd_df) * 100
         report.append(f"  {group}: {n:,} ({pct:.1f}%)")
     report.append("")
+    
     report.append("[AR(1) AUTOREGRESSIVE COEFFICIENT]")
-    for group, mean in ar1_stats['group_means'].items():
+    for group in ['Decline', 'Stable', 'Improved']:
+        mean = ar1_stats['group_means'][group]
         sd = ar1_stats['group_sds'][group]
-        report.append(f"  {group}: {mean:.3f} ± {sd:.3f}")
-    report.append(f"t-statistic (Decline vs Stable): {ar1_stats['t_statistic']:.3f}")
-    report.append(f"p-value: {ar1_stats['t_pvalue']:.2e}")
+        n = ar1_stats['group_n'][group]
+        report.append(f"  {group}: {mean:.3f} +/- {sd:.3f} (n={n})")
+    report.append(f"")
+    report.append(f"Decline vs Stable:")
+    report.append(f"  t-statistic: {ar1_stats['t_statistic']:.3f}")
+    report.append(f"  p-value: {ar1_stats['t_pvalue']:.2e}")
+    report.append(f"  Cohen's d: {ar1_stats['cohens_d']:.3f}")
     report.append("")
-    report.append("[VARIANCE (Winsorized)]")
-    for group, mean in var_stats['group_means'].items():
+    
+    report.append("[VARIANCE (Winsorized at 5th/95th percentile)]")
+    for group in ['Decline', 'Stable', 'Improved']:
+        mean = var_stats['group_means'][group]
         sd = var_stats['group_sds'][group]
-        report.append(f"  {group}: {mean:.3f} ± {sd:.3f}")
+        report.append(f"  {group}: {mean:.3f} +/- {sd:.3f}")
+    report.append(f"")
+    report.append(f"Decline vs Stable:")
+    report.append(f"  Cohen's d: {var_stats['cohens_d']:.3f}")
     report.append("")
-    report.append("[PREDICTION PERFORMANCE]")
-    report.append(f"AUC: {performance['auc']:.3f}")
-    report.append(f"Sensitivity: {performance['sensitivity']:.3f}")
-    report.append(f"Specificity: {performance['specificity']:.3f}")
+    
+    report.append("[CCI PREDICTION PERFORMANCE]")
+    report.append(f"  AUC: {performance['auc']:.3f}")
+    report.append(f"  Sensitivity: {performance['sensitivity']:.3f}")
+    report.append(f"  Specificity: {performance['specificity']:.3f}")
+    report.append(f"  PPV: {performance['ppv']:.3f}")
+    report.append(f"  NPV: {performance['npv']:.3f}")
+    report.append(f"  Optimal threshold: {performance['optimal_threshold']:.3f}")
     report.append("")
-    report.append("[EXTERNAL VALIDATION CONCLUSION]")
-    report.append("✓ AR(1) elevated in Decline group (consistent with CHARLS)")
-    report.append("✓ Variance elevated in Decline group (consistent with CHARLS)")
-    report.append("✓ CCI predicts cognitive decline: AUC comparable to CHARLS")
-    report.append("✓ Cross-population generalizability confirmed")
+    
+    report.append("[CROSS-COHORT COMPARISON]")
+    report.append("                      CHARLS          ELSA")
+    report.append(f"  Sample size:        3,487           {len(csd_df):,}")
+    report.append(f"  AR(1) Decline:      0.054           {ar1_stats['group_means']['Decline']:.3f}")
+    report.append(f"  AR(1) Stable:       -0.514          {ar1_stats['group_means']['Stable']:.3f}")
+    report.append(f"  Cohen's d:          1.001           {ar1_stats['cohens_d']:.3f}")
+    report.append(f"  AUC:                0.752           {performance['auc']:.3f}")
+    report.append("")
+    
+    report.append("[VALIDATION CONCLUSION]")
+    ar1_validated = ar1_stats['group_means']['Decline'] > ar1_stats['group_means']['Stable']
+    var_validated = var_stats['group_means']['Decline'] > var_stats['group_means']['Stable']
+    auc_validated = performance['auc'] >= 0.70
+    
+    report.append(f"  AR(1) elevated in Decline group: {'CONFIRMED' if ar1_validated else 'NOT CONFIRMED'}")
+    report.append(f"  Variance elevated in Decline group: {'CONFIRMED' if var_validated else 'NOT CONFIRMED'}")
+    report.append(f"  CCI predictive validity (AUC >= 0.70): {'CONFIRMED' if auc_validated else 'NOT CONFIRMED'}")
+    
+    if ar1_validated and var_validated and auc_validated:
+        report.append("")
+        report.append("  EXTERNAL VALIDATION: SUCCESSFUL")
+        report.append("  Critical slowing down theory replicated in independent cohort.")
+    
+    report.append("")
+    report.append("=" * 70)
     
     report_text = "\n".join(report)
     if output_path:
@@ -243,50 +325,53 @@ def generate_validation_report(csd_df, ar1_stats, var_stats, performance, output
 
 
 def main(args):
-    import os
     os.makedirs(args.output, exist_ok=True)
     
     print("Loading ELSA data...")
     df = load_elsa_data(args.input)
     
-    print("Constructing ELSA cohort...")
-    cohort = construct_elsa_cohort(df)
+    print("Constructing cohort (Waves 4-9, age >= 50, complete memory data)...")
+    cohort = construct_elsa_cohort(df, min_wave=4, max_wave=9)
+    print(f"  Cohort size: {cohort['idauniq'].nunique():,} participants")
     
     print("Computing trajectory slopes...")
     slopes = compute_trajectory_slope(cohort, 'memory', id_col='idauniq')
     
-    print("Classifying trajectories...")
+    print("Classifying trajectories (tertile-based)...")
     groups = classify_trajectories(slopes)
     
     print("Computing critical slowing down indicators...")
     csd_df = compute_csd_indicators(cohort, 'memory', groups, id_col='idauniq')
     csd_df = compute_cci(csd_df)
+    print(f"  Valid CSD observations: {len(csd_df.dropna(subset=['ar1', 'variance'])):,}")
     
-    print("Computing statistics...")
-    ar1_stats = compute_statistics(csd_df, 'ar1')
+    print("Computing group statistics...")
+    ar1_stats = compute_statistics(csd_df, 'ar1', use_winsorize=False)
     var_stats = compute_statistics(csd_df, 'variance', use_winsorize=True)
     
-    print("Evaluating prediction performance...")
-    performance = evaluate_prediction(csd_df)
+    print("Evaluating CCI prediction performance...")
+    performance = evaluate_prediction(csd_df, predictor='cci')
     
     print("Generating visualization...")
-    fig_path = f"{args.output}/elsa_validation.png"
+    fig_path = os.path.join(args.output, "elsa_validation.png")
     create_validation_figure(csd_df, performance, fig_path)
     
-    report_path = f"{args.output}/elsa_validation_report.txt"
+    print("Generating validation report...")
+    report_path = os.path.join(args.output, "elsa_validation_report.txt")
     report = generate_validation_report(csd_df, ar1_stats, var_stats, performance, report_path)
+    print("")
     print(report)
     
-    results_path = f"{args.output}/elsa_csd_results.csv"
+    results_path = os.path.join(args.output, "elsa_csd_results.csv")
     csd_df.to_csv(results_path, index=False)
     
-    print(f"External validation complete. Results saved to {args.output}/")
+    print(f"\nExternal validation complete. Results saved to {args.output}/")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ELSA External Validation")
-    parser.add_argument("--input", type=str, required=True, help="Input ELSA CSV")
-    parser.add_argument("--output", type=str, required=True, help="Output directory")
+    parser = argparse.ArgumentParser(description="ELSA External Validation for Critical Slowing Down")
+    parser.add_argument("--input", type=str, required=True, help="Path to ELSA merged CSV file")
+    parser.add_argument("--output", type=str, required=True, help="Output directory for results")
     
     args = parser.parse_args()
     main(args)
