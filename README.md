@@ -1,4 +1,5 @@
-# Critical Slowing Down as an Early Warning Signal for Cognitive Decline
+# Dynamic instability constitutes a pathological dimension of cognitive decline independent of structural atrophy.<img width="468" height="55" alt="image" src="https://github.com/user-attachments/assets/7df5d56a-2fc3-4e75-afa0-732602eecc5e" />
+
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
