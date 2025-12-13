@@ -38,10 +38,7 @@ cognitive-critical-slowing/
 │   │   ├── step2_cohort_construction.py
 │   │   ├── step3_critical_slowing_analysis.py
 │   │   └── step4_robustness_validation.py
-│   ├── elsa/
-│   │   ├── step1_data_cleaning.py
-│   │   ├── step2_cohort_construction.py
-│   │   └── step3_critical_slowing_analysis.py
+│   │   └── step5_biomarker_validation.py
 │   ├── adni/
 │   │   ├── step1_data_cleaning.py
 │   │   ├── step2_icv_correction.py
