@@ -1,0 +1,633 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+from scipy.spatial.distance import mahalanobis
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def load_and_select_variables(filepath):
+    
+    print("="*70)
+    print("ADNI Data Cleaning Pipeline - Phase 1: Data Loading")
+    print("="*70)
+    
+    df_raw = pd.read_csv(filepath, low_memory=False)
+    print(f"Raw data: {len(df_raw):,} rows, {df_raw['RID'].nunique():,} subjects")
+    
+    core_vars = {
+        'id': ['RID'],
+        'visit': ['VISCODE', 'VISCODE2'],
+        'date': ['EXAMDATE', 'VISDATE', 'USERDATE'],
+        'diagnosis': ['DX', 'DX_bl'],
+        'cognition': ['ADAS13', 'ADAS11', 'MMSE', 'CDRSB', 'RAVLT_immediate', 
+                      'RAVLT_learning', 'RAVLT_forgetting', 'FAQ'],
+        'imaging': ['Hippocampus', 'Ventricles', 'WholeBrain', 'Entorhinal',
+                    'Fusiform', 'MidTemp', 'ICV'],
+        'biomarkers': ['AV45', 'FDG', 'TAU', 'PTAU', 'ABETA'],
+        'covariates': ['AGE', 'PTGENDER', 'PTEDUCAT', 'APOE4', 'PTETHCAT', 'PTRACCAT']
+    }
+    
+    cols_to_keep = []
+    col_mapping = {}
+    
+    for category, var_list in core_vars.items():
+        for var in var_list:
+            if var in df_raw.columns:
+                cols_to_keep.append(var)
+                col_mapping[var] = category
+    
+    df = df_raw[cols_to_keep].copy()
+    
+    print(f"\nRetained variables: {len(cols_to_keep)} columns")
+    for category in core_vars.keys():
+        cat_vars = [v for v, c in col_mapping.items() if c == category]
+        if cat_vars:
+            print(f"  {category}: {cat_vars}")
+    
+    return df, col_mapping
+
+
+def standardize_timeline(df):
+    
+    print("\n" + "="*70)
+    print("Phase 2: Timeline Standardization")
+    print("="*70)
+    
+    date_col = None
+    for col in ['EXAMDATE', 'VISDATE', 'USERDATE']:
+        if col in df.columns:
+            date_col = col
+            break
+    
+    if date_col is None:
+        print("Warning: No date column found, using VISCODE encoding")
+        return _fallback_viscode_parsing(df)
+    
+    df['exam_date'] = pd.to_datetime(df[date_col], errors='coerce')
+    
+    baseline_dates = df.groupby('RID')['exam_date'].min().reset_index()
+    baseline_dates.columns = ['RID', 'baseline_date']
+    
+    df = df.merge(baseline_dates, on='RID', how='left')
+    
+    df['months_from_baseline'] = (
+        (df['exam_date'] - df['baseline_date']).dt.days / 30.44
+    ).round(1)
+    
+    def assign_timepoint(months):
+        if pd.isna(months):
+            return None
+        if months < 3:
+            return 0
+        elif months < 9:
+            return 6
+        elif months < 15:
+            return 12
+        elif months < 21:
+            return 18
+        elif months < 30:
+            return 24
+        elif months < 42:
+            return 36
+        elif months < 54:
+            return 48
+        elif months < 66:
+            return 60
+        elif months < 90:
+            return 72
+        elif months < 108:
+            return 96
+        else:
+            return 120
+    
+    df['Month'] = df['months_from_baseline'].apply(assign_timepoint)
+    
+    df['time_deviation'] = abs(df['months_from_baseline'] - df['Month'])
+    df = df.sort_values(['RID', 'Month', 'time_deviation'])
+    df = df.drop_duplicates(subset=['RID', 'Month'], keep='first')
+    
+    df = df.sort_values(['RID', 'Month']).reset_index(drop=True)
+    
+    valid_time = df['Month'].notna().sum()
+    print(f"Time parsing success: {valid_time:,} / {len(df):,} ({100*valid_time/len(df):.1f}%)")
+    print(f"Time range: {df['Month'].min():.0f} - {df['Month'].max():.0f} months")
+    
+    return df
+
+
+def _fallback_viscode_parsing(df):
+    
+    def parse_viscode(code):
+        if pd.isna(code):
+            return None
+        code = str(code).lower().strip()
+        
+        if code in ['bl', 'sc', 'scmri']:
+            return 0
+        if code.startswith('m'):
+            try:
+                return int(code[1:])
+            except:
+                return None
+        if code.startswith('y'):
+            try:
+                return int(code[1:]) * 12
+            except:
+                return None
+        return None
+    
+    viscode_col = 'VISCODE2' if 'VISCODE2' in df.columns else 'VISCODE'
+    df['Month'] = df[viscode_col].apply(parse_viscode)
+    df = df.dropna(subset=['Month'])
+    df = df.sort_values(['RID', 'Month']).reset_index(drop=True)
+    
+    return df
+
+
+def correct_neuroimaging(df):
+    
+    print("\n" + "="*70)
+    print("Phase 3: Neuroimaging ICV Correction")
+    print("="*70)
+    
+    if 'ICV' not in df.columns:
+        print("Warning: ICV column not found, skipping correction")
+        return df
+    
+    volume_vars = ['Hippocampus', 'Ventricles', 'WholeBrain', 
+                   'Entorhinal', 'Fusiform', 'MidTemp']
+    volume_vars = [v for v in volume_vars if v in df.columns]
+    
+    df['ICV'] = pd.to_numeric(df['ICV'], errors='coerce')
+    for var in volume_vars:
+        df[var] = pd.to_numeric(df[var], errors='coerce')
+    
+    icv_valid = df['ICV'].notna() & (df['ICV'] > 1000000) & (df['ICV'] < 2500000)
+    print(f"ICV valid values: {icv_valid.sum():,} / {len(df):,}")
+    
+    mean_icv = df.loc[icv_valid, 'ICV'].mean()
+    print(f"Population ICV mean: {mean_icv:,.0f} mm³")
+    
+    for var in volume_vars:
+        adj_var = f"{var}_adj"
+        
+        valid_mask = df[var].notna() & df['ICV'].notna() & icv_valid
+        
+        if valid_mask.sum() < 100:
+            print(f"  {var}: Insufficient valid data, skipping")
+            continue
+        
+        X = df.loc[valid_mask, 'ICV'].values
+        y = df.loc[valid_mask, var].values
+        
+        slope, intercept, r_value, p_value, std_err = stats.linregress(X, y)
+        
+        df[adj_var] = df[var] - slope * (df['ICV'] - mean_icv)
+        
+        print(f"  {var}: beta={slope:.6f}, R2={r_value**2:.3f}, correction complete")
+    
+    return df
+
+
+def detect_and_handle_outliers(df):
+    
+    print("\n" + "="*70)
+    print("Phase 4: Outlier Detection")
+    print("="*70)
+    
+    outlier_flags = pd.DataFrame(index=df.index)
+    outlier_flags['any_outlier'] = False
+    
+    numeric_vars = ['ADAS13', 'MMSE', 'Hippocampus_adj', 'Ventricles_adj']
+    numeric_vars = [v for v in numeric_vars if v in df.columns]
+    
+    print("\nUnivariate 3SD detection:")
+    for var in numeric_vars:
+        if df[var].notna().sum() < 50:
+            continue
+            
+        mean_val = df[var].mean()
+        std_val = df[var].std()
+        
+        lower_bound = mean_val - 3 * std_val
+        upper_bound = mean_val + 3 * std_val
+        
+        outlier_mask = (df[var] < lower_bound) | (df[var] > upper_bound)
+        outlier_flags[f'{var}_outlier'] = outlier_mask
+        outlier_flags['any_outlier'] |= outlier_mask
+        
+        n_outliers = outlier_mask.sum()
+        print(f"  {var}: {n_outliers} outliers ({100*n_outliers/len(df):.2f}%)")
+    
+    print("\nMultivariate Mahalanobis distance detection:")
+    
+    mv_vars = [v for v in ['ADAS13', 'MMSE', 'Hippocampus_adj'] if v in df.columns]
+    if len(mv_vars) >= 2:
+        mv_data = df[mv_vars].dropna()
+        
+        if len(mv_data) > len(mv_vars) * 10:
+            try:
+                mean = mv_data.mean().values
+                cov = mv_data.cov().values
+                inv_cov = np.linalg.pinv(cov)
+                
+                distances = mv_data.apply(
+                    lambda x: mahalanobis(x.values, mean, inv_cov), axis=1
+                )
+                
+                threshold = np.sqrt(stats.chi2.ppf(0.975, df=len(mv_vars)))
+                
+                mv_outliers = distances > threshold
+                outlier_flags.loc[mv_data.index, 'mahalanobis_outlier'] = mv_outliers
+                outlier_flags.loc[mv_data.index, 'any_outlier'] |= mv_outliers
+                
+                print(f"  Mahalanobis outliers: {mv_outliers.sum()} ({100*mv_outliers.mean():.2f}%)")
+            except Exception as e:
+                print(f"  Mahalanobis calculation failed: {e}")
+    
+    print("\nPhysiological boundary check:")
+    
+    physio_bounds = {
+        'ADAS13': (0, 85),
+        'MMSE': (0, 30),
+        'Hippocampus': (2000, 10000),
+        'Hippocampus_adj': (2000, 10000),
+        'ICV': (1000000, 2500000),
+        'AGE': (50, 100)
+    }
+    
+    for var, (lower, upper) in physio_bounds.items():
+        if var in df.columns:
+            invalid = (df[var] < lower) | (df[var] > upper)
+            invalid = invalid & df[var].notna()
+            
+            if invalid.sum() > 0:
+                print(f"  {var}: {invalid.sum()} out of physiological range [{lower}, {upper}]")
+                df.loc[invalid, var] = np.nan
+    
+    print("\nLongitudinal consistency check (annualized change rate):")
+    
+    if 'ADAS13' in df.columns:
+        df_sorted = df.sort_values(['RID', 'Month'])
+        df_sorted['ADAS13_prev'] = df_sorted.groupby('RID')['ADAS13'].shift(1)
+        df_sorted['Month_prev'] = df_sorted.groupby('RID')['Month'].shift(1)
+        
+        df_sorted['annual_change'] = (
+            (df_sorted['ADAS13'] - df_sorted['ADAS13_prev']) / 
+            ((df_sorted['Month'] - df_sorted['Month_prev']) / 12)
+        )
+        
+        valid_changes = df_sorted['annual_change'].dropna()
+        if len(valid_changes) > 50:
+            change_std = valid_changes.std()
+            extreme_change = abs(df_sorted['annual_change']) > 2 * change_std
+            extreme_ids = df_sorted.loc[extreme_change, 'RID'].unique()
+            print(f"  Extreme annualized change: {len(extreme_ids)} subjects")
+    
+    total_outliers = outlier_flags['any_outlier'].sum()
+    print(f"\nTotal flagged outliers: {total_outliers} observations ({100*total_outliers/len(df):.2f}%)")
+    
+    df['outlier_flag'] = outlier_flags['any_outlier']
+    
+    return df
+
+
+def identify_diagnostic_transitions(df):
+    
+    print("\n" + "="*70)
+    print("Phase 5: Diagnostic Transition Identification")
+    print("="*70)
+    
+    dx_col = 'DX' if 'DX' in df.columns else 'DX_bl'
+    
+    def standardize_dx(dx):
+        if pd.isna(dx):
+            return None
+        dx = str(dx).upper().strip()
+        
+        if 'DEMENTIA' in dx or dx == 'AD':
+            return 'Dementia'
+        elif 'MCI' in dx or 'LMCI' in dx or 'EMCI' in dx:
+            return 'MCI'
+        elif 'CN' in dx or 'NL' in dx or 'NORMAL' in dx:
+            return 'CN'
+        else:
+            return None
+    
+    df['DX_std'] = df[dx_col].apply(standardize_dx)
+    
+    print("Diagnosis distribution:")
+    print(df['DX_std'].value_counts())
+    
+    trajectory_records = []
+    
+    for rid, group in df.groupby('RID'):
+        group = group.sort_values('Month')
+        dx_sequence = group['DX_std'].dropna().tolist()
+        months = group.loc[group['DX_std'].notna(), 'Month'].tolist()
+        
+        if len(dx_sequence) < 2:
+            trajectory = 'Insufficient'
+        else:
+            baseline_dx = dx_sequence[0]
+            final_dx = dx_sequence[-1]
+            
+            if baseline_dx == 'CN':
+                if 'MCI' in dx_sequence[1:] or 'Dementia' in dx_sequence[1:]:
+                    trajectory = 'CN_Converter'
+                else:
+                    trajectory = 'CN_Stable'
+                    
+            elif baseline_dx == 'MCI':
+                if 'Dementia' in dx_sequence[1:]:
+                    trajectory = 'MCI_Converter'
+                elif 'CN' in dx_sequence[1:]:
+                    trajectory = 'MCI_Reverter'
+                else:
+                    trajectory = 'MCI_Stable'
+                    
+            elif baseline_dx == 'Dementia':
+                trajectory = 'Dementia_Baseline'
+            else:
+                trajectory = 'Unknown'
+        
+        trajectory_records.append({
+            'RID': rid,
+            'trajectory': trajectory,
+            'baseline_dx': dx_sequence[0] if dx_sequence else None,
+            'final_dx': dx_sequence[-1] if dx_sequence else None,
+            'n_visits': len(dx_sequence),
+            'followup_months': months[-1] if months else 0
+        })
+    
+    traj_df = pd.DataFrame(trajectory_records)
+    
+    print("\nDiagnostic trajectory distribution:")
+    print(traj_df['trajectory'].value_counts())
+    
+    df = df.merge(traj_df[['RID', 'trajectory', 'baseline_dx']], on='RID', how='left')
+    
+    return df, traj_df
+
+
+def filter_longitudinal_cohort(df, min_visits=3, min_followup_months=12):
+    
+    print("\n" + "="*70)
+    print("Phase 6: Longitudinal Cohort Filtering")
+    print("="*70)
+    
+    visit_stats = df.groupby('RID').agg({
+        'Month': ['count', 'min', 'max'],
+        'ADAS13': lambda x: x.notna().sum()
+    }).reset_index()
+    
+    visit_stats.columns = ['RID', 'n_visits', 'first_month', 'last_month', 'n_adas']
+    visit_stats['followup_months'] = visit_stats['last_month'] - visit_stats['first_month']
+    
+    if 'Hippocampus_adj' in df.columns:
+        imaging_counts = df.groupby('RID')['Hippocampus_adj'].apply(
+            lambda x: x.notna().sum()
+        ).reset_index()
+        imaging_counts.columns = ['RID', 'n_imaging']
+        visit_stats = visit_stats.merge(imaging_counts, on='RID', how='left')
+        visit_stats['n_imaging'] = visit_stats['n_imaging'].fillna(0)
+    else:
+        visit_stats['n_imaging'] = 0
+    
+    visit_stats['cohort_tier'] = 'Excluded'
+    
+    bronze_mask = (visit_stats['n_visits'] >= 2) & (visit_stats['n_adas'] >= 2)
+    visit_stats.loc[bronze_mask, 'cohort_tier'] = 'Bronze'
+    
+    silver_mask = (visit_stats['n_visits'] >= 3) & (visit_stats['n_adas'] >= 3)
+    visit_stats.loc[silver_mask, 'cohort_tier'] = 'Silver'
+    
+    gold_mask = (
+        (visit_stats['n_visits'] >= 4) & 
+        (visit_stats['n_adas'] >= 4) & 
+        (visit_stats['n_imaging'] >= 2)
+    )
+    visit_stats.loc[gold_mask, 'cohort_tier'] = 'Gold'
+    
+    print("Cohort stratification:")
+    print(visit_stats['cohort_tier'].value_counts())
+    
+    print(f"\nGold cohort: {(visit_stats['cohort_tier']=='Gold').sum()} subjects")
+    print(f"Silver cohort: {(visit_stats['cohort_tier']=='Silver').sum()} subjects")
+    print(f"Bronze cohort: {(visit_stats['cohort_tier']=='Bronze').sum()} subjects")
+    
+    df = df.merge(visit_stats[['RID', 'cohort_tier', 'n_visits', 'followup_months']], 
+                  on='RID', how='left')
+    
+    df_main = df[df['cohort_tier'].isin(['Silver', 'Gold'])].copy()
+    
+    print(f"\nMain analysis cohort: {df_main['RID'].nunique()} subjects, {len(df_main)} observations")
+    
+    return df, df_main, visit_stats
+
+
+def classify_cognitive_trajectories(df, outcome_var='ADAS13'):
+    
+    print("\n" + "="*70)
+    print("Phase 7: Cognitive Trajectory Classification")
+    print("="*70)
+    
+    if outcome_var not in df.columns:
+        print(f"Warning: {outcome_var} not found, skipping trajectory classification")
+        return df
+    
+    slope_records = []
+    
+    for rid, group in df.groupby('RID'):
+        group = group.sort_values('Month')
+        valid_data = group[[outcome_var, 'Month']].dropna()
+        
+        if len(valid_data) >= 2:
+            x = valid_data['Month'].values
+            y = valid_data[outcome_var].values
+            
+            slope, intercept, r, p, se = stats.linregress(x, y)
+            annual_slope = slope * 12
+            
+            slope_records.append({
+                'RID': rid,
+                'annual_slope': annual_slope,
+                'baseline_score': y[0],
+                'final_score': y[-1],
+                'n_points': len(valid_data),
+                'r_squared': r**2
+            })
+    
+    slope_df = pd.DataFrame(slope_records)
+    
+    print(f"Slope calculation: {len(slope_df)} subjects")
+    print(f"Annualized slope distribution: mean={slope_df['annual_slope'].mean():.3f}, "
+          f"std={slope_df['annual_slope'].std():.3f}")
+    
+    q_low = slope_df['annual_slope'].quantile(0.33)
+    q_high = slope_df['annual_slope'].quantile(0.67)
+    
+    def assign_group(slope):
+        if slope >= q_high:
+            return 'Decline'
+        elif slope <= q_low:
+            return 'Improved'
+        else:
+            return 'Stable'
+    
+    slope_df['trajectory_group'] = slope_df['annual_slope'].apply(assign_group)
+    
+    print("\nTrajectory grouping:")
+    print(slope_df['trajectory_group'].value_counts())
+    
+    df = df.merge(slope_df[['RID', 'annual_slope', 'trajectory_group']], 
+                  on='RID', how='left')
+    
+    return df, slope_df
+
+
+def generate_quality_report(df, output_prefix='ADNI'):
+    
+    print("\n" + "="*70)
+    print("Phase 8: Data Quality Report")
+    print("="*70)
+    
+    report = []
+    report.append("="*70)
+    report.append("ADNI Data Cleaning Quality Report")
+    report.append("="*70)
+    report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    report.append("")
+    
+    report.append("[Sample Size]")
+    report.append(f"Total observations: {len(df):,}")
+    report.append(f"Total subjects: {df['RID'].nunique():,}")
+    
+    if 'cohort_tier' in df.columns:
+        for tier in ['Gold', 'Silver', 'Bronze']:
+            n = df[df['cohort_tier']==tier]['RID'].nunique()
+            report.append(f"  {tier} cohort: {n:,} subjects")
+    
+    report.append("\n[Demographics]")
+    if 'AGE' in df.columns:
+        age_mean = df.groupby('RID')['AGE'].first().mean()
+        age_std = df.groupby('RID')['AGE'].first().std()
+        report.append(f"Age: {age_mean:.1f} +/- {age_std:.1f} years")
+    
+    if 'PTGENDER' in df.columns:
+        gender_pct = df.groupby('RID')['PTGENDER'].first().value_counts(normalize=True)
+        for g, pct in gender_pct.items():
+            report.append(f"Gender {g}: {100*pct:.1f}%")
+    
+    if 'PTEDUCAT' in df.columns:
+        edu_mean = df.groupby('RID')['PTEDUCAT'].first().mean()
+        report.append(f"Education: {edu_mean:.1f} years")
+    
+    report.append("\n[Diagnosis Distribution]")
+    if 'baseline_dx' in df.columns:
+        dx_dist = df.groupby('RID')['baseline_dx'].first().value_counts()
+        for dx, n in dx_dist.items():
+            report.append(f"  {dx}: {n} ({100*n/df['RID'].nunique():.1f}%)")
+    
+    report.append("\n[Cognitive Trajectory Groups]")
+    if 'trajectory_group' in df.columns:
+        traj_dist = df.groupby('RID')['trajectory_group'].first().value_counts()
+        for traj, n in traj_dist.items():
+            report.append(f"  {traj}: {n} ({100*n/df['RID'].nunique():.1f}%)")
+    
+    report.append("\n[Core Variable Completeness]")
+    core_vars = ['ADAS13', 'MMSE', 'Hippocampus_adj', 'AV45', 'APOE4']
+    for var in core_vars:
+        if var in df.columns:
+            coverage = 100 * df[var].notna().mean()
+            report.append(f"  {var}: {coverage:.1f}%")
+    
+    report.append("\n[Follow-up Characteristics]")
+    if 'n_visits' in df.columns:
+        visit_mean = df.groupby('RID')['n_visits'].first().mean()
+        report.append(f"Mean follow-up visits: {visit_mean:.2f}")
+    
+    if 'followup_months' in df.columns:
+        followup_mean = df.groupby('RID')['followup_months'].first().mean()
+        report.append(f"Mean follow-up duration: {followup_mean:.1f} months")
+    
+    report.append("\n" + "="*70)
+    
+    report_text = "\n".join(report)
+    print(report_text)
+    
+    report_file = f"{output_prefix}_cleaning_report.txt"
+    with open(report_file, 'w') as f:
+        f.write(report_text)
+    print(f"\nReport saved: {report_file}")
+    
+    return report_text
+
+
+def run_full_pipeline(filepath, output_prefix='ADNI'):
+    
+    print("\n" + "="*70)
+    print("ADNI Data Cleaning Pipeline")
+    print("="*70)
+    print(f"Input file: {filepath}")
+    print(f"Output prefix: {output_prefix}")
+    print("="*70)
+    
+    df, col_mapping = load_and_select_variables(filepath)
+    
+    df = standardize_timeline(df)
+    
+    df = correct_neuroimaging(df)
+    
+    df = detect_and_handle_outliers(df)
+    
+    df, traj_df = identify_diagnostic_transitions(df)
+    
+    df_all, df_main, visit_stats = filter_longitudinal_cohort(df)
+    
+    df_main, slope_df = classify_cognitive_trajectories(df_main)
+    
+    report = generate_quality_report(df_main, output_prefix)
+    
+    print("\n" + "="*70)
+    print("Saving Output Files")
+    print("="*70)
+    
+    main_file = f"{output_prefix}_main_cohort.csv"
+    df_main.to_csv(main_file, index=False)
+    print(f"Main analysis cohort: {main_file}")
+    
+    all_file = f"{output_prefix}_all_cleaned.csv"
+    df_all.to_csv(all_file, index=False)
+    print(f"Complete cleaned data: {all_file}")
+    
+    traj_file = f"{output_prefix}_trajectories.csv"
+    traj_df.to_csv(traj_file, index=False)
+    print(f"Diagnostic trajectories: {traj_file}")
+    
+    slope_file = f"{output_prefix}_slopes.csv"
+    slope_df.to_csv(slope_file, index=False)
+    print(f"Cognitive slopes: {slope_file}")
+    
+    print("\n" + "="*70)
+    print("Cleaning pipeline complete!")
+    print("="*70)
+    
+    return df_main, df_all, traj_df, slope_df
+
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: python ADNI_cleaning_pipeline_en.py <ADNIMERGE.csv> [output_prefix]")
+        print("\nExample:")
+        print("  python ADNI_cleaning_pipeline_en.py ADNIMERGE.csv ADNI")
+        sys.exit(1)
+    
+    filepath = sys.argv[1]
+    output_prefix = sys.argv[2] if len(sys.argv) > 2 else 'ADNI'
+    
+    df_main, df_all, traj_df, slope_df = run_full_pipeline(filepath, output_prefix)
