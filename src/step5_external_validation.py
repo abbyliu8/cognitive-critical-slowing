@@ -9,17 +9,10 @@ import os
 
 
 def load_data(filepath):
-    """Load ELSA data from CSV file."""
     return pd.read_csv(filepath, low_memory=False)
 
 
 def create_min_wave_cohort(df, outcome_col, min_waves=6, id_col='idauniq', wave_col='wave'):
-    """
-    Create cohort with minimum wave requirement.
-    
-    Returns (cohort_df, wave_counts) where wave_counts shows distribution
-    of observation counts per participant (useful for selection bias reporting).
-    """
     wave_counts = df.groupby(id_col).apply(
         lambda x: x.loc[x[outcome_col].notna(), wave_col].nunique()
     )
@@ -29,12 +22,6 @@ def create_min_wave_cohort(df, outcome_col, min_waves=6, id_col='idauniq', wave_
 
 
 def compute_trajectory_slope(df, outcome_col, id_col='idauniq', wave_col='wave'):
-    """
-    Compute trajectory slope using actual wave values.
-    
-    Critical: Uses actual wave numbers (e.g., 4,5,6,8,9) not sequential indices (0,1,2,3,4).
-    This is important for ELSA where some waves may be missing.
-    """
     slopes = {}
     for pid in df[id_col].unique():
         person_data = df[df[id_col] == pid].sort_values(wave_col)
@@ -76,11 +63,6 @@ def classify_trajectories(slopes, method='tertile'):
 
 
 def compute_ar1_ols(y, x, detrend=True):
-    """
-    Compute AR(1) via OLS using actual wave values for detrending.
-    
-    This correctly handles unequal wave spacing in ELSA.
-    """
     if len(y) < 3:
         return np.nan
     
@@ -106,7 +88,6 @@ def compute_ar1_ols(y, x, detrend=True):
 
 
 def compute_variance_detrended(y, x, detrend=True):
-    """Compute variance using actual wave values for detrending."""
     if len(y) < 2:
         return np.nan
     
@@ -125,12 +106,6 @@ def compute_variance_detrended(y, x, detrend=True):
 
 
 def compute_csd_indicators(df, outcome_col, groups, id_col='idauniq', wave_col='wave', detrend=True):
-    """
-    Compute CSD indicators using actual wave values.
-    
-    Returns DataFrame with 'participant_id' as unified ID column
-    for cross-cohort compatibility.
-    """
     results = []
     
     for pid in df[id_col].unique():
@@ -159,13 +134,6 @@ def compute_csd_indicators(df, outcome_col, groups, id_col='idauniq', wave_col='
 
 
 def compute_cci(csd_df):
-    """
-    Compute Comprehensive Criticality Index.
-    
-    Note: CCI is z-score normalized within cohort.
-    Threshold=0 corresponds to the cohort-specific mean of the standardized CCI.
-    This is a relative threshold, not an absolute clinical cutoff.
-    """
     valid_df = csd_df.dropna(subset=['ar1', 'variance']).copy()
     
     if len(valid_df) < 2:
@@ -260,7 +228,6 @@ def evaluate_association(csd_df, predictor='cci'):
 
 
 def create_visualization(csd_df, ar1_stats, var_stats, association, output_path):
-    """Create 6-panel ELSA validation figure."""
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     
     groups = ['Decline', 'Stable', 'Improved']
@@ -476,7 +443,6 @@ def generate_report(csd_df, ar1_stats, var_stats, association, thresholds, outpu
 
 
 def main(args):
-    """Main ELSA validation pipeline."""
     os.makedirs(args.output, exist_ok=True)
     
     print("Loading ELSA data...")
