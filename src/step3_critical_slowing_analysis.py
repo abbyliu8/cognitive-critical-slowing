@@ -40,41 +40,16 @@ def validate_input_data(df, id_col='ID', wave_col='wave', outcome_col='memory'):
 
 
 def compute_ar1_ols(y, x, detrend=True):
-    """
-    Compute AR(1) coefficient using OLS regression (phi parameter).
-    
-    Parameters
-    ----------
-    y : array-like
-        Outcome values (already sorted by time)
-    x : array-like
-        Actual wave/time values (same length as y)
-    detrend : bool
-        If True, remove linear trend before AR(1) estimation
-    
-    Returns
-    -------
-    float
-        AR(1) phi coefficient, or NaN if insufficient data
-    
-    Notes
-    -----
-    Uses OLS regression: y_t = alpha + phi * y_{t-1} + epsilon
-    This estimates the phi parameter directly, unlike correlation which
-    conflates trend effects when the mean drifts over time.
-    """
     if len(y) < 3:
         return np.nan
     
     y = np.asarray(y, dtype=float)
     x = np.asarray(x, dtype=float)
     
-    # Guard: detrend requires at least 2 distinct x values
     if detrend and np.unique(x).size < 2:
         return np.nan
     
     if detrend:
-        # Detrend using actual wave values (not sequential indices)
         trend = stats.linregress(x, y)
         y = y - (trend.slope * x + trend.intercept)
     
@@ -84,36 +59,17 @@ def compute_ar1_ols(y, x, detrend=True):
     if np.std(y_t1) == 0:
         return np.nan
     
-    # OLS: y_t = alpha + phi * y_{t-1} + epsilon
     result = stats.linregress(y_t1, y_t)
     return result.slope
 
 
 def compute_variance_detrended(y, x, detrend=True):
-    """
-    Compute variance, optionally after detrending.
-    
-    Parameters
-    ----------
-    y : array-like
-        Outcome values
-    x : array-like
-        Actual wave/time values
-    detrend : bool
-        If True, compute variance of residuals after removing linear trend
-    
-    Returns
-    -------
-    float
-        Variance (ddof=1), or NaN if insufficient data
-    """
     if len(y) < 2:
         return np.nan
     
     y = np.asarray(y, dtype=float)
     x = np.asarray(x, dtype=float)
     
-    # Guard: detrend requires at least 2 distinct x values
     if detrend and np.unique(x).size < 2:
         return np.nan
     
@@ -125,36 +81,11 @@ def compute_variance_detrended(y, x, detrend=True):
 
 
 def compute_csd_indicators(df, outcome_col, id_col='ID', wave_col='wave', detrend=True):
-    """
-    Compute critical slowing down indicators for each participant.
-    Uses actual wave values for detrending (not sequential indices).
-    
-    Parameters
-    ----------
-    df : DataFrame
-        Longitudinal cohort data with trajectory_group column
-    outcome_col : str
-        Name of the outcome variable (e.g., 'memory')
-    id_col : str
-        Name of the participant ID column
-    wave_col : str
-        Name of the wave/time column
-    detrend : bool
-        Whether to detrend before computing AR(1) and variance
-    
-    Returns
-    -------
-    DataFrame
-        One row per participant with columns:
-        - participant_id: unified ID column name for cross-cohort compatibility
-        - ar1, variance, trajectory_group, n_observations, wave_min, wave_max
-    """
     results = []
     
     for pid in df[id_col].unique():
         person_data = df[df[id_col] == pid].sort_values(wave_col)
         
-        # Get non-missing outcome and corresponding waves
         mask = person_data[outcome_col].notna()
         y = person_data.loc[mask, outcome_col].values
         x = person_data.loc[mask, wave_col].values.astype(float)
@@ -162,18 +93,14 @@ def compute_csd_indicators(df, outcome_col, id_col='ID', wave_col='wave', detren
         ar1 = compute_ar1_ols(y, x, detrend=detrend)
         variance = compute_variance_detrended(y, x, detrend=detrend)
         
-        # trajectory_group is guaranteed unique per ID (validated earlier)
-        group = person_data['trajectory_group'].iloc[0]
+        group = person_data.sort_values(wave_col)['trajectory_group'].iloc[0]
         
-        # Use unified column name 'participant_id' for cross-cohort compatibility
         results.append({
             'participant_id': pid,
             'ar1': ar1,
             'variance': variance,
             'trajectory_group': group,
-            'n_observations': len(y),
-            'wave_min': x.min() if len(x) > 0 else np.nan,
-            'wave_max': x.max() if len(x) > 0 else np.nan
+            'n_observations': len(y)
         })
     
     return pd.DataFrame(results)
@@ -206,67 +133,39 @@ def cohens_d(group1, group2):
     return (group1.mean() - group2.mean()) / pooled_std
 
 
-def group_comparison_statistics(csd_df, metric, group_col='trajectory_group'):
-    """
-    Compute group comparison statistics using both parametric and non-parametric tests.
-    
-    Returns dictionary with:
-    - Kruskal-Wallis H (3-group non-parametric)
-    - ANOVA F (3-group parametric, for reference)
-    - Welch t-test (Decline vs Stable, unequal variance)
-    - Mann-Whitney U (Decline vs Stable, non-parametric)
-    - Cohen's d (effect size)
-    - Group means, SDs, medians, IQRs
-    """
+def group_comparison_statistics(csd_df, metric):
     groups = ['Decline', 'Stable', 'Improved']
-    group_data = {g: csd_df[csd_df[group_col] == g][metric].dropna() for g in groups}
+    group_data = {g: csd_df[csd_df['trajectory_group'] == g][metric].dropna() for g in groups}
     
     valid_groups = [group_data[g] for g in groups if len(group_data[g]) > 1]
     if len(valid_groups) < 2:
         return None
     
-    # Non-parametric: Kruskal-Wallis
-    h_stat, kw_pvalue = stats.kruskal(*valid_groups)
-    
-    # Parametric: ANOVA (for reference)
-    f_stat, f_pvalue = stats.f_oneway(*valid_groups)
+    h_stat, kw_p = stats.kruskal(*valid_groups)
     
     results = {
         'kruskal_h': h_stat,
-        'kruskal_p': kw_pvalue,
-        'f_statistic': f_stat,
-        'f_pvalue': f_pvalue,
+        'kruskal_p': kw_p,
         'group_means': {g: group_data[g].mean() for g in groups if len(group_data[g]) > 0},
         'group_sds': {g: group_data[g].std() for g in groups if len(group_data[g]) > 0},
-        'group_medians': {g: group_data[g].median() for g in groups if len(group_data[g]) > 0},
-        'group_iqrs': {g: group_data[g].quantile(0.75) - group_data[g].quantile(0.25) 
-                       for g in groups if len(group_data[g]) > 0},
         'group_ns': {g: len(group_data[g]) for g in groups}
     }
     
-    # Pairwise: Decline vs Stable
     if len(group_data['Decline']) > 1 and len(group_data['Stable']) > 1:
         d1, d2 = group_data['Decline'], group_data['Stable']
-        
-        t_stat, t_pvalue = stats.ttest_ind(d1, d2, equal_var=False)  # Welch
-        u_stat, mw_pvalue = stats.mannwhitneyu(d1, d2, alternative='two-sided')
+        t_stat, welch_p = stats.ttest_ind(d1, d2, equal_var=False)
+        u_stat, mw_p = stats.mannwhitneyu(d1, d2, alternative='two-sided')
         
         results['welch_t'] = t_stat
-        results['welch_p'] = t_pvalue
+        results['welch_p'] = welch_p
         results['mannwhitney_u'] = u_stat
-        results['mannwhitney_p'] = mw_pvalue
+        results['mannwhitney_p'] = mw_p
         results['cohens_d'] = cohens_d(d1, d2)
     
     return results
 
 
 def evaluate_association_strength(csd_df, predictor='cci', target_group='Decline'):
-    """
-    Evaluate association between CCI and trajectory group using AUC.
-    
-    Note: This is association/discrimination, not prospective prediction.
-    AUC quantifies how well CCI discriminates between groups defined on the same series.
-    """
     valid_df = csd_df.dropna(subset=[predictor, 'trajectory_group'])
     
     y_true = (valid_df['trajectory_group'] == target_group).astype(int)
@@ -298,90 +197,84 @@ def evaluate_association_strength(csd_df, predictor='cci', target_group='Decline
 
 
 def create_visualization(csd_df, association, output_path):
-    """Create 6-panel visualization."""
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     
     groups = ['Decline', 'Stable', 'Improved']
     colors = {'Decline': '#e74c3c', 'Stable': '#3498db', 'Improved': '#2ecc71'}
     
-    # Panel A: AR(1) distribution
     ax = axes[0, 0]
     for group in groups:
         data = csd_df[csd_df['trajectory_group'] == group]['ar1'].dropna()
         if len(data) > 0:
-            ax.hist(data, bins=30, alpha=0.6, label=f'{group} (n={len(data)})', color=colors[group])
-    ax.set_xlabel('AR(1) Coefficient (OLS phi, detrended)')
+            ax.hist(data, bins=30, alpha=0.5, label=f'{group} (n={len(data)})', color=colors[group])
+    ax.set_xlabel('AR(1) Coefficient')
     ax.set_ylabel('Frequency')
-    ax.set_title('A. AR(1) Distribution by Group')
-    ax.axvline(x=0, color='black', linestyle='--', alpha=0.5)
+    ax.set_title('A. AR(1) Distribution by Trajectory Group')
     ax.legend()
+    ax.axvline(x=0, color='black', linestyle='--', alpha=0.5)
     
-    # Panel B: Variance distribution
     ax = axes[0, 1]
     for group in groups:
         data = csd_df[csd_df['trajectory_group'] == group]['variance'].dropna()
         if len(data) > 0:
-            ax.hist(data, bins=30, alpha=0.6, label=group, color=colors[group])
-    ax.set_xlabel('Variance (detrended)')
+            ax.hist(data, bins=30, alpha=0.5, label=f'{group} (n={len(data)})', color=colors[group])
+    ax.set_xlabel('Variance')
     ax.set_ylabel('Frequency')
-    ax.set_title('B. Variance Distribution by Group')
+    ax.set_title('B. Variance Distribution by Trajectory Group')
     ax.legend()
     
-    # Panel C: CCI distribution - threshold line BEFORE legend
     ax = axes[0, 2]
     for group in groups:
         data = csd_df[csd_df['trajectory_group'] == group]['cci'].dropna()
         if len(data) > 0:
-            ax.hist(data, bins=30, alpha=0.6, label=group, color=colors[group])
-    ax.set_xlabel('Comprehensive Criticality Index')
+            ax.hist(data, bins=30, alpha=0.5, label=f'{group} (n={len(data)})', color=colors[group])
+    ax.set_xlabel('CCI')
     ax.set_ylabel('Frequency')
-    ax.set_title('C. CCI Distribution by Group')
-    ax.axvline(x=0, color='black', linestyle='--', alpha=0.5, label='Threshold=0')
+    ax.set_title('C. CCI Distribution by Trajectory Group')
     ax.legend()
+    ax.axvline(x=0, color='black', linestyle='--', alpha=0.5)
     
-    # Panel D: AR(1) bar plot
     ax = axes[1, 0]
-    group_means = []
-    group_sems = []
-    for g in groups:
-        data = csd_df[csd_df['trajectory_group'] == g]['ar1'].dropna()
-        group_means.append(data.mean() if len(data) > 0 else 0)
-        group_sems.append(data.sem() if len(data) > 1 else 0)
-    
-    ax.bar(groups, group_means, yerr=group_sems, 
-           color=[colors[g] for g in groups], capsize=5, alpha=0.8)
-    ax.set_ylabel('Mean AR(1) ± SEM')
-    ax.set_title('D. AR(1) by Trajectory Group')
+    box_data = [csd_df[csd_df['trajectory_group'] == g]['ar1'].dropna() for g in groups]
+    bp = ax.boxplot(box_data, labels=groups, patch_artist=True)
+    for patch, group in zip(bp['boxes'], groups):
+        patch.set_facecolor(colors[group])
+        patch.set_alpha(0.5)
+    ax.set_ylabel('AR(1) Coefficient')
+    ax.set_title('D. AR(1) by Group (Box Plot)')
     ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
     
-    # Panel E: ROC curve
     ax = axes[1, 1]
     if association:
-        ax.plot(association['fpr'], association['tpr'], 'b-', linewidth=2, 
-                label=f'AUC = {association["auc"]:.3f}')
-        ax.plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Chance')
-    ax.set_xlabel('False Positive Rate')
-    ax.set_ylabel('True Positive Rate')
-    ax.set_title('E. ROC Curve (CCI vs Decline)')
-    ax.legend(loc='lower right')
-    ax.set_xlim([0, 1])
-    ax.set_ylim([0, 1])
-    ax.text(0.55, 0.15, 'Association strength\n(not prospective prediction)', 
-            fontsize=9, style='italic', alpha=0.7)
+        ax.plot(association['fpr'], association['tpr'], 'b-', linewidth=2,
+                label=f"AUC = {association['auc']:.3f}")
+        ax.plot([0, 1], [0, 1], 'k--', alpha=0.5)
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title('E. ROC Curve: CCI vs Decline')
+        ax.legend(loc='lower right')
+        ax.set_xlim([0, 1])
+        ax.set_ylim([0, 1])
+    else:
+        ax.text(0.5, 0.5, 'AUC not available', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title('E. ROC Curve: CCI vs Decline')
     
-    # Panel F: Variance bar plot
     ax = axes[1, 2]
-    group_means = []
-    group_sems = []
-    for g in groups:
-        data = csd_df[csd_df['trajectory_group'] == g]['variance'].dropna()
-        group_means.append(data.mean() if len(data) > 0 else 0)
-        group_sems.append(data.sem() if len(data) > 1 else 0)
-    
-    ax.bar(groups, group_means, yerr=group_sems, 
-           color=[colors[g] for g in groups], capsize=5, alpha=0.8)
-    ax.set_ylabel('Mean Variance ± SEM')
-    ax.set_title('F. Variance by Trajectory Group')
+    if association:
+        metrics = ['Sensitivity', 'Specificity', 'PPV', 'NPV']
+        values = [association['sensitivity'], association['specificity'],
+                  association['ppv'], association['npv']]
+        bars = ax.bar(metrics, values, color=['#3498db', '#2ecc71', '#f39c12', '#9b59b6'])
+        ax.set_ylim([0, 1])
+        ax.set_ylabel('Value')
+        ax.set_title(f"F. Performance at threshold=0")
+        for bar, val in zip(bars, values):
+            if not np.isnan(val):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                        f'{val:.2f}', ha='center', va='bottom')
+    else:
+        ax.text(0.5, 0.5, 'Metrics not available', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title('F. Performance Metrics')
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -390,105 +283,58 @@ def create_visualization(csd_df, association, output_path):
 
 
 def generate_analysis_report(csd_df, ar1_stats, var_stats, cci_stats, association, detrend, output_path=None):
-    """Generate comprehensive analysis report."""
     report = []
     report.append("=" * 70)
     report.append("CRITICAL SLOWING DOWN ANALYSIS REPORT")
-    report.append("Association between CSD indicators and cognitive trajectory")
     report.append("=" * 70)
     report.append("")
     
-    report.append("[METHODOLOGICAL NOTES]")
-    report.append("  - AR(1) estimated via OLS regression: y_t = alpha + phi*y_{t-1} + e")
-    report.append(f"  - Detrending before CSD calculation: {'Yes (using actual wave values)' if detrend else 'No'}")
-    report.append("  - Statistical tests: Kruskal-Wallis (3-group), Welch t-test (pairwise)")
-    report.append("  - AUC represents ASSOCIATION strength, NOT prospective prediction")
-    report.append("  - For prospective prediction, use prefix-window design (step3b)")
-    report.append("")
-    
     report.append("[SAMPLE]")
-    n_total = len(csd_df)
-    report.append(f"Total participants with valid CSD: {n_total:,}")
-    for group in ['Decline', 'Stable', 'Improved']:
-        n = (csd_df['trajectory_group'] == group).sum()
-        pct = n / n_total * 100 if n_total > 0 else 0
-        report.append(f"  {group}: {n:,} ({pct:.1f}%)")
+    report.append(f"  Total with valid CSD: {len(csd_df):,}")
+    for g in ['Decline', 'Stable', 'Improved']:
+        n = (csd_df['trajectory_group'] == g).sum()
+        report.append(f"    {g}: {n:,}")
     report.append("")
     
-    report.append("[AR(1) AUTOREGRESSIVE COEFFICIENT]")
+    report.append("[METHODOLOGY]")
+    report.append(f"  Detrending: {'Yes (wave-aware)' if detrend else 'No'}")
+    report.append("  AR(1): OLS regression (phi parameter)")
+    report.append("  Tests: Kruskal-Wallis, Welch t-test, Mann-Whitney U")
+    report.append("  Threshold: 0 (cohort-specific z-score mean)")
+    report.append("")
+    
     if ar1_stats:
-        report.append("  Group statistics:")
-        for group in ['Decline', 'Stable', 'Improved']:
-            if group in ar1_stats['group_means']:
-                m = ar1_stats['group_means'][group]
-                s = ar1_stats['group_sds'][group]
-                med = ar1_stats['group_medians'][group]
-                iqr = ar1_stats['group_iqrs'][group]
-                n = ar1_stats['group_ns'][group]
-                report.append(f"    {group}: {m:.3f} +/- {s:.3f}, median {med:.3f} [IQR {iqr:.3f}] (n={n})")
+        report.append("[AR(1) RESULTS]")
+        for g in ['Decline', 'Stable', 'Improved']:
+            m = ar1_stats['group_means'].get(g, np.nan)
+            s = ar1_stats['group_sds'].get(g, np.nan)
+            n = ar1_stats['group_ns'].get(g, 0)
+            report.append(f"  {g}: {m:.3f} +/- {s:.3f} (n={n})")
         report.append(f"  Kruskal-Wallis H = {ar1_stats['kruskal_h']:.2f}, p = {ar1_stats['kruskal_p']:.2e}")
-        if 'welch_t' in ar1_stats:
-            report.append(f"  Decline vs Stable:")
-            report.append(f"    Welch t = {ar1_stats['welch_t']:.2f}, p = {ar1_stats['welch_p']:.2e}")
-            report.append(f"    Mann-Whitney p = {ar1_stats['mannwhitney_p']:.2e}")
-            report.append(f"    Cohen's d = {ar1_stats['cohens_d']:.3f}")
-    report.append("")
+        if 'cohens_d' in ar1_stats:
+            report.append(f"  Cohen's d (Decline vs Stable) = {ar1_stats['cohens_d']:.3f}")
+        report.append("")
     
-    report.append("[VARIANCE]")
     if var_stats:
-        for group in ['Decline', 'Stable', 'Improved']:
-            if group in var_stats['group_means']:
-                m = var_stats['group_means'][group]
-                s = var_stats['group_sds'][group]
-                med = var_stats['group_medians'][group]
-                iqr = var_stats['group_iqrs'][group]
-                report.append(f"    {group}: {m:.3f} +/- {s:.3f}, median {med:.3f} [IQR {iqr:.3f}]")
+        report.append("[VARIANCE RESULTS]")
+        for g in ['Decline', 'Stable', 'Improved']:
+            m = var_stats['group_means'].get(g, np.nan)
+            s = var_stats['group_sds'].get(g, np.nan)
+            n = var_stats['group_ns'].get(g, 0)
+            report.append(f"  {g}: {m:.3f} +/- {s:.3f} (n={n})")
         report.append(f"  Kruskal-Wallis H = {var_stats['kruskal_h']:.2f}, p = {var_stats['kruskal_p']:.2e}")
-        if 'cohens_d' in var_stats:
-            report.append(f"  Cohen's d (Decline vs Stable) = {var_stats['cohens_d']:.3f}")
-    report.append("")
+        report.append("")
     
-    report.append("[COMPREHENSIVE CRITICALITY INDEX (CCI)]")
-    report.append("  CCI = (z_AR1 + z_Variance) / 2")
-    if cci_stats:
-        for group in ['Decline', 'Stable', 'Improved']:
-            if group in cci_stats['group_means']:
-                m = cci_stats['group_means'][group]
-                s = cci_stats['group_sds'][group]
-                report.append(f"    {group}: {m:.3f} +/- {s:.3f}")
-        report.append(f"  Kruskal-Wallis H = {cci_stats['kruskal_h']:.2f}, p = {cci_stats['kruskal_p']:.2e}")
-    report.append("")
-    
-    report.append("[ASSOCIATION STRENGTH]")
-    report.append("  NOTE: AUC quantifies association, NOT prospective prediction accuracy.")
-    report.append("        CCI and trajectory_group are computed from the SAME time series.")
-    report.append("  IMPORTANT: Threshold=0 corresponds to the COHORT-SPECIFIC mean of")
-    report.append("             the standardized CCI, not an absolute clinical threshold.")
-    report.append("             For cross-cohort comparison, use fixed scaler or percentile cutoffs.")
     if association:
+        report.append("[CCI DISCRIMINATION]")
         report.append(f"  AUC: {association['auc']:.3f}")
-        report.append(f"  At fixed threshold = 0 (cohort-specific z-score mean):")
-        report.append(f"    Sensitivity: {association['sensitivity']:.3f}")
-        report.append(f"    Specificity: {association['specificity']:.3f}")
-    report.append("")
+        report.append(f"  Threshold: {association['threshold_used']:.1f}")
+        report.append(f"  Sensitivity: {association['sensitivity']:.3f}")
+        report.append(f"  Specificity: {association['specificity']:.3f}")
+        report.append(f"  PPV: {association['ppv']:.3f}")
+        report.append(f"  NPV: {association['npv']:.3f}")
+        report.append("")
     
-    report.append("[THEORETICAL INTERPRETATION]")
-    if ar1_stats and 'cohens_d' in ar1_stats:
-        d = ar1_stats['cohens_d']
-        effect_label = "Large" if d > 0.8 else "Medium" if d > 0.5 else "Small" if d > 0.2 else "Negligible"
-        
-        ar1_decline = ar1_stats['group_means'].get('Decline', 0)
-        ar1_stable = ar1_stats['group_means'].get('Stable', 0)
-        
-        if ar1_decline > ar1_stable:
-            report.append(f"  AR(1): Decline > Stable (d={d:.2f}, {effect_label} effect)")
-            report.append("  Interpretation: Decline group shows HIGHER autocorrelation,")
-            report.append("                  consistent with critical slowing down theory.")
-            report.append("                  (Reduced resilience = slower recovery from perturbations)")
-        else:
-            report.append(f"  AR(1): Decline <= Stable (unexpected direction)")
-    
-    report.append("")
     report.append("=" * 70)
     
     report_text = "\n".join(report)
@@ -503,7 +349,7 @@ def generate_analysis_report(csd_df, ar1_stats, var_stats, cci_stats, associatio
 def main(args):
     os.makedirs(args.output, exist_ok=True)
     
-    print("Loading cohort data...")
+    print("Loading data...")
     df = load_cohort_data(args.input)
     
     outcome_col = args.outcome
@@ -523,14 +369,15 @@ def main(args):
     print("\nValidating input data...")
     validate_input_data(df, id_col=args.id_col, wave_col=args.wave_col, outcome_col=outcome_col)
     
-    print("\nComputing critical slowing down indicators (wave-aware)...")
-    csd_df = compute_csd_indicators(df, outcome_col, id_col=args.id_col, 
+    n_input = df[args.id_col].nunique()
+    
+    print("\nComputing CSD indicators...")
+    csd_df = compute_csd_indicators(df, outcome_col, id_col=args.id_col,
                                      wave_col=args.wave_col, detrend=args.detrend)
     
     print("Computing Comprehensive Criticality Index...")
     csd_df = compute_cci(csd_df)
     
-    # Check group sizes after CSD filtering (may differ from input due to NaN drops)
     final_counts = csd_df['trajectory_group'].value_counts()
     if len(final_counts) < 2 or final_counts.min() < 2:
         print(f"[WARNING] Group sizes after CSD filtering are small: {final_counts.to_dict()}")
@@ -559,50 +406,35 @@ def main(args):
     print("")
     print(report)
     
-    # Save results
     results_path = os.path.join(args.output, "csd_results.csv")
     csd_df.to_csv(results_path, index=False)
     
-    # Save summary
     summary = {
-        'n_total': len(csd_df),
+        'n_input': n_input,
+        'n_valid_csd': len(csd_df),
         'n_decline': (csd_df['trajectory_group'] == 'Decline').sum(),
         'n_stable': (csd_df['trajectory_group'] == 'Stable').sum(),
         'ar1_cohens_d': ar1_stats['cohens_d'] if ar1_stats and 'cohens_d' in ar1_stats else np.nan,
-        'var_cohens_d': var_stats['cohens_d'] if var_stats and 'cohens_d' in var_stats else np.nan,
-        'auc': association['auc'] if association else np.nan
+        'auc': association['auc'] if association else np.nan,
+        'sensitivity': association['sensitivity'] if association else np.nan,
+        'specificity': association['specificity'] if association else np.nan,
+        'npv': association['npv'] if association else np.nan
     }
-    pd.DataFrame([summary]).to_csv(os.path.join(args.output, "csd_summary.csv"), index=False)
+    
+    summary_df = pd.DataFrame([summary])
+    summary_df.to_csv(os.path.join(args.output, "csd_summary.csv"), index=False)
     
     print(f"\nAnalysis complete. Results saved to {args.output}/")
-    return csd_df, association
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Critical Slowing Down Analysis (Wave-Aware)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-        
-Outputs:
-  - csd_analysis.png/pdf  : 6-panel visualization
-  - csd_analysis_report.txt : Comprehensive statistics report
-  - csd_results.csv : Individual-level AR(1), variance, CCI (participant_id column)
-  - csd_summary.csv : Key metrics (n, Cohen's d, AUC)
-        """
-    )
-    parser.add_argument("--input", type=str, required=True, 
-                        help="Input cohort CSV with trajectory_group column")
-    parser.add_argument("--output", type=str, required=True, 
-                        help="Output directory")
-    parser.add_argument("--outcome", type=str, default="memory", 
-                        help="Primary outcome variable name (default: memory)")
-    parser.add_argument("--id-col", type=str, default="ID", dest="id_col",
-                        help="Column name for participant ID (default: ID)")
-    parser.add_argument("--wave-col", type=str, default="wave", dest="wave_col",
-                        help="Column name for wave/time (default: wave)")
-    parser.add_argument("--no-detrend", dest="detrend", action="store_false",
-                        help="Do not detrend before CSD calculation (default: detrend)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=str, required=True)
+    parser.add_argument("--output", type=str, required=True)
+    parser.add_argument("--outcome", type=str, default="memory")
+    parser.add_argument("--id-col", type=str, default="ID", dest="id_col")
+    parser.add_argument("--wave-col", type=str, default="wave", dest="wave_col")
+    parser.add_argument("--no-detrend", dest="detrend", action="store_false")
     parser.set_defaults(detrend=True)
     
     args = parser.parse_args()
