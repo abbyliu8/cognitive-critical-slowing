@@ -9,15 +9,10 @@ import os
 
 
 def load_cohort_data(filepath):
-    """Load cohort data from CSV file."""
     return pd.read_csv(filepath, low_memory=False)
 
 
 def create_cohort_by_waves(df, outcome_col, min_waves=3, id_col='ID', wave_col='wave'):
-    """
-    Create cohort with minimum number of waves with non-missing outcome.
-    """
-    # CRITICAL: Count distinct waves, not rows
     wave_counts = df.groupby(id_col).apply(
         lambda x: x.loc[x[outcome_col].notna(), wave_col].nunique()
     )
@@ -26,9 +21,6 @@ def create_cohort_by_waves(df, outcome_col, min_waves=3, id_col='ID', wave_col='
 
 
 def compute_trajectory_slope(df, outcome_col, id_col='ID', wave_col='wave'):
-    """
-    Compute trajectory slope using actual wave values (not sequential indices).
-    """
     slopes = {}
     for pid in df[id_col].unique():
         person_data = df[df[id_col] == pid].sort_values(wave_col)
@@ -49,10 +41,6 @@ def compute_trajectory_slope(df, outcome_col, id_col='ID', wave_col='wave'):
 
 
 def classify_trajectories(slopes, method='tertile'):
-    """
-    Classify trajectories into Decline/Stable/Improved based on slopes.
-    Returns both groups and thresholds for reproducibility.
-    """
     valid_slopes = slopes.dropna()
     
     if len(valid_slopes) < 10:
@@ -103,7 +91,6 @@ def compute_ar1_ols(y, x, detrend=True):
 
 
 def compute_variance_detrended(y, x, detrend=True):
-    """Compute variance after optional detrending."""
     if len(y) < 2:
         return np.nan
     
@@ -122,10 +109,6 @@ def compute_variance_detrended(y, x, detrend=True):
 
 
 def compute_csd_indicators(df, outcome_col, groups, id_col='ID', wave_col='wave', detrend=True):
-    """
-    Compute CSD indicators for each participant.
-    Output uses unified 'participant_id' column for cross-cohort compatibility.
-    """
     results = []
     
     for pid in df[id_col].unique():
@@ -214,7 +197,6 @@ def compute_group_statistics(csd_df, metric):
 
 
 def evaluate_prediction(csd_df, predictor='cci', threshold=0.0):
-    """Evaluate discrimination performance with fixed threshold."""
     valid_df = csd_df.dropna(subset=[predictor, 'trajectory_group'])
     
     y_true = (valid_df['trajectory_group'] == 'Decline').astype(int)
