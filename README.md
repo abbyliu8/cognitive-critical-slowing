@@ -41,11 +41,8 @@ cognitive-critical-slowing/
 │   │   └── step4_robustness_validation.py
 │   │   └── step5_biomarker_validation.py
 │   ├── adni/
-│   │   ├── step1_data_cleaning.py
-│   │   ├── step2_icv_correction.py
-│   │   ├── step3_cohort_construction.py
-│   │   ├── step4_critical_slowing_analysis.py
-│   │   └── step5_biomarker_validation.py
+│   │   ├── ADNI_cleaning_pipeline.py
+│   │   ├── ADNI_critical_slowing.py
 │   └── utils.py
 ├── docs/
 │   ├── methods_supplement.md
