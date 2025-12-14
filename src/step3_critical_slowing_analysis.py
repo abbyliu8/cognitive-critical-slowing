@@ -583,14 +583,7 @@ if __name__ == "__main__":
         description="Critical Slowing Down Analysis (Wave-Aware)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # CHARLS (default column names)
-  python step3_critical_slowing_analysis.py --input cohort.csv --output results/
-  
-  # ELSA (custom column names)
-  python step3_critical_slowing_analysis.py --input elsa.csv --output results/ \\
-      --id-col idauniq --wave-col wave --outcome memory
-
+        
 Outputs:
   - csd_analysis.png/pdf  : 6-panel visualization
   - csd_analysis_report.txt : Comprehensive statistics report
