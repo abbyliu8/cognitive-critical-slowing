@@ -1,0 +1,458 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def calculate_ar1_coefficient(time_series, time_points=None, method='ols'):
+    
+    y = np.array(time_series)
+    
+    valid_mask = ~np.isnan(y)
+    y = y[valid_mask]
+    
+    if len(y) < 3:
+        return np.nan, np.nan
+    
+    if time_points is not None:
+        t = np.array(time_points)[valid_mask]
+    else:
+        t = np.arange(len(y))
+    
+    y_prev = y[:-1]
+    y_curr = y[1:]
+    
+    if method == 'ols':
+        try:
+            slope, intercept, r, p, se = stats.linregress(y_prev, y_curr)
+            return slope, se
+        except:
+            return np.nan, np.nan
+    
+    elif method == 'yule_walker':
+        try:
+            from statsmodels.regression.linear_model import yule_walker
+            rho, sigma = yule_walker(y, order=1)
+            return rho[0], sigma / np.sqrt(len(y))
+        except:
+            return np.nan, np.nan
+
+
+def calculate_ar1_with_time_correction(time_series, time_points, target_interval=12):
+    
+    y = np.array(time_series)
+    t = np.array(time_points)
+    
+    valid_mask = ~np.isnan(y) & ~np.isnan(t)
+    y = y[valid_mask]
+    t = t[valid_mask]
+    
+    if len(y) < 3:
+        return np.nan, np.nan
+    
+    intervals = np.diff(t)
+    
+    y_prev = y[:-1]
+    y_curr = y[1:]
+    
+    ar1_segments = []
+    weights = []
+    
+    for i in range(len(intervals)):
+        if intervals[i] > 0:
+            local_rho = (y_curr[i] - np.mean(y)) / (y_prev[i] - np.mean(y)) if (y_prev[i] - np.mean(y)) != 0 else 0
+            
+            corrected_rho = np.sign(local_rho) * (abs(local_rho) ** (target_interval / intervals[i]))
+            
+            corrected_rho = np.clip(corrected_rho, -1, 1)
+            
+            ar1_segments.append(corrected_rho)
+            weights.append(1 / intervals[i])
+    
+    if len(ar1_segments) == 0:
+        return np.nan, np.nan
+    
+    weights = np.array(weights)
+    weights = weights / weights.sum()
+    ar1_mean = np.average(ar1_segments, weights=weights)
+    ar1_se = np.sqrt(np.average((np.array(ar1_segments) - ar1_mean)**2, weights=weights))
+    
+    return ar1_mean, ar1_se
+
+
+def calculate_group_ar1(df, group_col='trajectory_group', outcome_col='ADAS13', 
+                        time_col='Month', id_col='RID'):
+    
+    print("\n" + "="*70)
+    print("AR(1) Autoregressive Coefficient Calculation")
+    print("="*70)
+    
+    results = []
+    
+    for rid, group in df.groupby(id_col):
+        group = group.sort_values(time_col)
+        
+        y = group[outcome_col].values
+        t = group[time_col].values
+        
+        ar1, se = calculate_ar1_with_time_correction(y, t)
+        
+        ar1_simple, _ = calculate_ar1_coefficient(y)
+        
+        variance = np.nanvar(y)
+        
+        results.append({
+            id_col: rid,
+            'ar1_corrected': ar1,
+            'ar1_simple': ar1_simple,
+            'ar1_se': se,
+            'variance': variance,
+            'n_obs': (~np.isnan(y)).sum(),
+            group_col: group[group_col].iloc[0] if group_col in group.columns else None
+        })
+    
+    results_df = pd.DataFrame(results)
+    
+    if group_col in results_df.columns and results_df[group_col].notna().any():
+        print("\nGroup AR(1) comparison:")
+        
+        groups = results_df[group_col].dropna().unique()
+        
+        for grp in groups:
+            grp_data = results_df[results_df[group_col]==grp]['ar1_corrected'].dropna()
+            print(f"  {grp}: {grp_data.mean():.3f} +/- {grp_data.std():.3f} (n={len(grp_data)})")
+        
+        group_data = [results_df[results_df[group_col]==g]['ar1_corrected'].dropna() 
+                      for g in groups]
+        group_data = [g for g in group_data if len(g) > 0]
+        
+        if len(group_data) >= 2:
+            f_stat, p_val = stats.f_oneway(*group_data)
+            print(f"\nANOVA: F={f_stat:.2f}, p={p_val:.2e}")
+            
+            if 'Decline' in groups and 'Stable' in groups:
+                d1 = results_df[results_df[group_col]=='Decline']['ar1_corrected'].dropna()
+                d2 = results_df[results_df[group_col]=='Stable']['ar1_corrected'].dropna()
+                
+                pooled_std = np.sqrt(((len(d1)-1)*d1.std()**2 + (len(d2)-1)*d2.std()**2) / 
+                                     (len(d1)+len(d2)-2))
+                cohens_d = (d1.mean() - d2.mean()) / pooled_std
+                
+                print(f"Cohen's d (Decline vs Stable): {cohens_d:.3f}")
+    
+    return results_df
+
+
+def calculate_variance_metrics(df, group_col='trajectory_group', outcome_col='ADAS13',
+                               id_col='RID', winsorize_pct=5):
+    
+    print("\n" + "="*70)
+    print("Variance Analysis")
+    print("="*70)
+    
+    var_data = df.groupby(id_col).apply(
+        lambda x: pd.Series({
+            'variance': x[outcome_col].var(),
+            'std': x[outcome_col].std(),
+            'cv': x[outcome_col].std() / x[outcome_col].mean() if x[outcome_col].mean() != 0 else np.nan,
+            'range': x[outcome_col].max() - x[outcome_col].min(),
+            'n_obs': x[outcome_col].notna().sum(),
+            group_col: x[group_col].iloc[0] if group_col in x.columns else None
+        })
+    ).reset_index()
+    
+    if winsorize_pct > 0:
+        lower = np.nanpercentile(var_data['variance'], winsorize_pct)
+        upper = np.nanpercentile(var_data['variance'], 100 - winsorize_pct)
+        var_data['variance_winsorized'] = var_data['variance'].clip(lower, upper)
+        var_col = 'variance_winsorized'
+        print(f"Winsorization: {winsorize_pct}th - {100-winsorize_pct}th percentile")
+    else:
+        var_col = 'variance'
+    
+    if group_col in var_data.columns:
+        print("\nGroup variance comparison:")
+        
+        for grp in var_data[group_col].dropna().unique():
+            grp_var = var_data[var_data[group_col]==grp][var_col].dropna()
+            print(f"  {grp}: {grp_var.mean():.3f} +/- {grp_var.std():.3f}")
+        
+        if 'Decline' in var_data[group_col].values and 'Stable' in var_data[group_col].values:
+            v1 = var_data[var_data[group_col]=='Decline'][var_col].dropna()
+            v2 = var_data[var_data[group_col]=='Stable'][var_col].dropna()
+            
+            t_stat, p_val = stats.ttest_ind(v1, v2)
+            fold_change = v1.mean() / v2.mean()
+            
+            print(f"\nDecline vs Stable:")
+            print(f"  t = {t_stat:.2f}, p = {p_val:.2e}")
+            print(f"  Fold change = {fold_change:.2f}x")
+    
+    return var_data
+
+
+def calculate_cci(ar1_df, var_df, id_col='RID', method='pca'):
+    
+    print("\n" + "="*70)
+    print("Comprehensive Criticality Index (CCI) Calculation")
+    print("="*70)
+    
+    cci_data = ar1_df[[id_col, 'ar1_corrected', 'trajectory_group']].copy()
+    
+    var_col = 'variance_winsorized' if 'variance_winsorized' in var_df.columns else 'variance'
+    cci_data = cci_data.merge(
+        var_df[[id_col, var_col]], on=id_col, how='inner'
+    )
+    
+    cci_data['z_ar1'] = stats.zscore(cci_data['ar1_corrected'].dropna())
+    cci_data['z_var'] = stats.zscore(cci_data[var_col].dropna())
+    
+    cci_data = cci_data.dropna(subset=['z_ar1', 'z_var'])
+    
+    if method == 'pca':
+        from sklearn.decomposition import PCA
+        
+        X = cci_data[['z_ar1', 'z_var']].values
+        pca = PCA(n_components=1)
+        cci_values = pca.fit_transform(X)
+        
+        print(f"PCA explained variance: {pca.explained_variance_ratio_[0]:.1%}")
+        print(f"Loadings: AR(1)={pca.components_[0,0]:.3f}, Var={pca.components_[0,1]:.3f}")
+        
+        cci_data['CCI'] = cci_values.flatten()
+        
+    elif method == 'equal':
+        cci_data['CCI'] = (cci_data['z_ar1'] + cci_data['z_var']) / 2
+        print("Using equal weights: w1=0.5, w2=0.5")
+        
+    else:
+        from scipy.optimize import minimize_scalar
+        
+        def neg_cohens_d(w):
+            cci_temp = w * cci_data['z_ar1'] + (1-w) * cci_data['z_var']
+            d1 = cci_temp[cci_data['trajectory_group']=='Decline']
+            d2 = cci_temp[cci_data['trajectory_group']=='Stable']
+            
+            if len(d1) < 2 or len(d2) < 2:
+                return 0
+            
+            pooled_std = np.sqrt(((len(d1)-1)*d1.std()**2 + (len(d2)-1)*d2.std()**2) / 
+                                 (len(d1)+len(d2)-2))
+            return -abs(d1.mean() - d2.mean()) / pooled_std
+        
+        result = minimize_scalar(neg_cohens_d, bounds=(0, 1), method='bounded')
+        optimal_w = result.x
+        
+        cci_data['CCI'] = optimal_w * cci_data['z_ar1'] + (1-optimal_w) * cci_data['z_var']
+        print(f"Optimal weights: w_AR1={optimal_w:.3f}, w_Var={1-optimal_w:.3f}")
+    
+    cci_data['CCI_normalized'] = (cci_data['CCI'] - cci_data['CCI'].min()) / \
+                                  (cci_data['CCI'].max() - cci_data['CCI'].min())
+    
+    print("\nGroup CCI comparison:")
+    for grp in cci_data['trajectory_group'].dropna().unique():
+        grp_cci = cci_data[cci_data['trajectory_group']==grp]['CCI']
+        print(f"  {grp}: {grp_cci.mean():.3f} +/- {grp_cci.std():.3f}")
+    
+    return cci_data
+
+
+def evaluate_prediction_performance(cci_data, target_group='Decline'):
+    
+    print("\n" + "="*70)
+    print(f"CCI Prediction Performance Evaluation (Target: {target_group})")
+    print("="*70)
+    
+    from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
+    
+    valid_data = cci_data.dropna(subset=['CCI', 'trajectory_group'])
+    y_true = (valid_data['trajectory_group'] == target_group).astype(int)
+    y_score = valid_data['CCI'].values
+    
+    if y_true.sum() < 10 or (1 - y_true).sum() < 10:
+        print("Warning: Insufficient sample size for reliable evaluation")
+        return None
+    
+    auc = roc_auc_score(y_true, y_score)
+    
+    n_bootstrap = 1000
+    auc_boots = []
+    
+    for _ in range(n_bootstrap):
+        idx = np.random.choice(len(y_true), len(y_true), replace=True)
+        if len(np.unique(y_true.iloc[idx])) < 2:
+            continue
+        auc_boot = roc_auc_score(y_true.iloc[idx], y_score[idx])
+        auc_boots.append(auc_boot)
+    
+    auc_ci = np.percentile(auc_boots, [2.5, 97.5])
+    
+    print(f"AUC: {auc:.3f} (95% CI: {auc_ci[0]:.3f}-{auc_ci[1]:.3f})")
+    
+    fpr, tpr, thresholds = roc_curve(y_true, y_score)
+    youden_idx = np.argmax(tpr - fpr)
+    optimal_threshold = thresholds[youden_idx]
+    
+    y_pred = (y_score >= optimal_threshold).astype(int)
+    
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    
+    sensitivity = tp / (tp + fn)
+    specificity = tn / (tn + fp)
+    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0
+    
+    print(f"\nOptimal threshold: {optimal_threshold:.3f}")
+    print(f"Sensitivity: {sensitivity:.1%}")
+    print(f"Specificity: {specificity:.1%}")
+    print(f"PPV: {ppv:.1%}")
+    print(f"NPV: {npv:.1%}")
+    
+    results = {
+        'auc': auc,
+        'auc_ci_lower': auc_ci[0],
+        'auc_ci_upper': auc_ci[1],
+        'optimal_threshold': optimal_threshold,
+        'sensitivity': sensitivity,
+        'specificity': specificity,
+        'ppv': ppv,
+        'npv': npv,
+        'n_target': y_true.sum(),
+        'n_control': (1 - y_true).sum()
+    }
+    
+    return results
+
+
+def compare_with_charls_elsa(adni_results, charls_ar1=0.054, charls_stable_ar1=-0.514,
+                              elsa_ar1=0.140, elsa_stable_ar1=-0.311):
+    
+    print("\n" + "="*70)
+    print("Cross-Cohort Comparison")
+    print("="*70)
+    
+    adni_decline = adni_results[adni_results['trajectory_group']=='Decline']['ar1_corrected'].mean()
+    adni_stable = adni_results[adni_results['trajectory_group']=='Stable']['ar1_corrected'].mean()
+    
+    comparison = pd.DataFrame({
+        'Cohort': ['CHARLS', 'ELSA', 'ADNI'],
+        'Population': ['Chinese', 'English', 'North American'],
+        'N': [3487, 5298, adni_results['trajectory_group'].notna().sum()],
+        'AR1_Decline': [charls_ar1, elsa_ar1, adni_decline],
+        'AR1_Stable': [charls_stable_ar1, elsa_stable_ar1, adni_stable],
+        'Modality': ['Cognition', 'Cognition', 'Cognition + Imaging']
+    })
+    
+    comparison['Delta_AR1'] = comparison['AR1_Decline'] - comparison['AR1_Stable']
+    
+    print("\nCross-cohort AR(1) comparison:")
+    print(comparison.to_string(index=False))
+    
+    print("\nConsistency assessment:")
+    
+    all_positive_delta = all(comparison['Delta_AR1'] > 0)
+    print(f"  Directional consistency: {'Yes' if all_positive_delta else 'No'} (all cohorts Decline > Stable)")
+    
+    delta_cv = comparison['Delta_AR1'].std() / comparison['Delta_AR1'].mean()
+    print(f"  Effect size consistency: CV = {delta_cv:.2%}")
+    
+    return comparison
+
+
+def neuroimaging_specific_analysis(df, ar1_df):
+    
+    print("\n" + "="*70)
+    print("Neuroimaging-Specific Analysis")
+    print("="*70)
+    
+    imaging_vars = ['Hippocampus_adj', 'Ventricles_adj', 'WholeBrain_adj', 'Entorhinal_adj']
+    imaging_vars = [v for v in imaging_vars if v in df.columns]
+    
+    if not imaging_vars:
+        print("Warning: No corrected imaging variables found")
+        return None
+    
+    baseline_imaging = df[df['Month']==0].groupby('RID')[imaging_vars].first().reset_index()
+    
+    merged = ar1_df.merge(baseline_imaging, on='RID', how='inner')
+    
+    print("\nImaging-AR(1) correlations:")
+    
+    correlations = {}
+    for var in imaging_vars:
+        valid = merged[[var, 'ar1_corrected']].dropna()
+        if len(valid) > 30:
+            r, p = stats.pearsonr(valid[var], valid['ar1_corrected'])
+            print(f"  {var}: r={r:.3f}, p={p:.3e}")
+            correlations[var] = {'r': r, 'p': p}
+    
+    print("\nBaseline imaging by trajectory group:")
+    
+    for var in imaging_vars:
+        if 'trajectory_group' in merged.columns:
+            for grp in ['Decline', 'Stable']:
+                grp_data = merged[merged['trajectory_group']==grp][var].dropna()
+                if len(grp_data) > 0:
+                    print(f"  {var} - {grp}: {grp_data.mean():.1f} +/- {grp_data.std():.1f}")
+    
+    return merged, correlations
+
+
+def run_critical_slowing_analysis(df, output_prefix='ADNI'):
+    
+    print("\n" + "="*70)
+    print("ADNI Critical Slowing Down Analysis - Full Pipeline")
+    print("="*70)
+    
+    ar1_df = calculate_group_ar1(df)
+    
+    var_df = calculate_variance_metrics(df)
+    
+    cci_df = calculate_cci(ar1_df, var_df)
+    
+    perf = evaluate_prediction_performance(cci_df)
+    
+    comparison = compare_with_charls_elsa(ar1_df)
+    
+    imaging_results = neuroimaging_specific_analysis(df, ar1_df)
+    
+    ar1_df.to_csv(f'{output_prefix}_ar1_results.csv', index=False)
+    var_df.to_csv(f'{output_prefix}_variance_results.csv', index=False)
+    cci_df.to_csv(f'{output_prefix}_cci_results.csv', index=False)
+    comparison.to_csv(f'{output_prefix}_cohort_comparison.csv', index=False)
+    
+    final_results = ar1_df.merge(
+        var_df[['RID', 'variance', 'variance_winsorized']], on='RID', how='left'
+    )
+    final_results = final_results.merge(
+        cci_df[['RID', 'CCI', 'CCI_normalized']], on='RID', how='left'
+    )
+    final_results.to_csv(f'{output_prefix}_critical_slowing_results.csv', index=False)
+    
+    print("\n" + "="*70)
+    print("Analysis complete! Output files:")
+    print(f"  - {output_prefix}_ar1_results.csv")
+    print(f"  - {output_prefix}_variance_results.csv")
+    print(f"  - {output_prefix}_cci_results.csv")
+    print(f"  - {output_prefix}_cohort_comparison.csv")
+    print(f"  - {output_prefix}_critical_slowing_results.csv")
+    print("="*70)
+    
+    return {
+        'ar1': ar1_df,
+        'variance': var_df,
+        'cci': cci_df,
+        'performance': perf,
+        'comparison': comparison
+    }
+
+
+if __name__ == "__main__":
+    print("This module requires ADNI_cleaning_pipeline_en.py")
+    print("Example:")
+    print("  from ADNI_cleaning_pipeline_en import run_full_pipeline")
+    print("  from ADNI_critical_slowing_en import run_critical_slowing_analysis")
+    print("")
+    print("  df_main, _, _, _ = run_full_pipeline('ADNIMERGE.csv')")
+    print("  results = run_critical_slowing_analysis(df_main)")
