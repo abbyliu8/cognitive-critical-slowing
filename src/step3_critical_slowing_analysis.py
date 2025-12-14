@@ -9,12 +9,10 @@ import os
 
 
 def load_cohort_data(filepath):
-    """Load cohort data from CSV file."""
     return pd.read_csv(filepath, low_memory=False)
 
 
 def validate_input_data(df, id_col='ID', wave_col='wave', outcome_col='memory'):
-    """Validate input data has required columns and trajectory_group."""
     required_cols = [id_col, wave_col, outcome_col]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
@@ -32,7 +30,6 @@ def validate_input_data(df, id_col='ID', wave_col='wave', outcome_col='memory'):
         n_missing = df[df['trajectory_group'].isna()][id_col].nunique()
         raise ValueError(f"trajectory_group missing for {n_missing} participants.")
     
-    # Check group sizes at participant level (sort by wave first for determinism)
     id_groups = df.sort_values([id_col, wave_col]).groupby(id_col)['trajectory_group'].first()
     counts = id_groups.value_counts()
     if len(counts) < 2 or counts.min() < 2:
@@ -183,16 +180,6 @@ def compute_csd_indicators(df, outcome_col, id_col='ID', wave_col='wave', detren
 
 
 def compute_cci(csd_df):
-    """
-    Compute Comprehensive Criticality Index (CCI) as mean of z-scored AR(1) and variance.
-    
-    CCI = (z_AR1 + z_Variance) / 2
-    
-    Higher CCI indicates greater criticality (closer to phase transition).
-    
-    Note: Z-scores are computed within the current cohort. Threshold=0 corresponds
-    to the cohort-specific mean, not an absolute clinical threshold.
-    """
     valid_df = csd_df.dropna(subset=['ar1', 'variance']).copy()
     
     if len(valid_df) < 2:
@@ -209,7 +196,6 @@ def compute_cci(csd_df):
 
 
 def cohens_d(group1, group2):
-    """Compute Cohen's d effect size with pooled standard deviation."""
     n1, n2 = len(group1), len(group2)
     if n1 < 2 or n2 < 2:
         return np.nan
@@ -515,7 +501,6 @@ def generate_analysis_report(csd_df, ar1_stats, var_stats, cci_stats, associatio
 
 
 def main(args):
-    """Main analysis pipeline."""
     os.makedirs(args.output, exist_ok=True)
     
     print("Loading cohort data...")
